@@ -129,7 +129,7 @@ if __name__ == "__main__":
 
     if master_key_val:
         login_data_db = os.path.join(default_profile_path, 'Login Data')
-        cookies_db = os.path.join(default_profile_path, 'Cookies')
+        cookies_db = os.path.join(default_profile_path, 'Network', 'Cookies')
 
         extract_data(login_data_db, master_key_val, 'Passwords')
         extract_data(cookies_db, master_key_val, 'Cookies')
